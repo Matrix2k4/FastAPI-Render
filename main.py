@@ -1,16 +1,32 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from pymongo import MongoClient
-from bson import ObjectId
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 app = FastAPI()
 
-# Connect to MongoDB Atlas
-client = MongoClient("mongodb://localhost:27017")
-db = client["library_management"]
-students_collection = db["students"]
+# SQLite Database URL
+DATABASE_URL = "sqlite:///./students.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# SQLAlchemy Model (Table)
+class StudentDB(Base):
+    __tablename__ = "students"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)
+    age = Column(Integer)
+    city = Column(String)
+    country = Column(String)
+
+# Create table
+Base.metadata.create_all(bind=engine)
 
 
+# Pydantic Models
 class Address(BaseModel):
     city: str
     country: str
@@ -22,47 +38,104 @@ class Student(BaseModel):
     address: Address
 
 
+# Dependency to get DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# CREATE
 @app.post("/students", status_code=201)
 async def create_student(student: Student):
-    result = students_collection.insert_one(student.dict())
-    return {"id": str(result.inserted_id)}
+    db = next(get_db())
+
+    new_student = StudentDB(
+        name=student.name,
+        age=student.age,
+        city=student.address.city,
+        country=student.address.country
+    )
+
+    db.add(new_student)
+    db.commit()
+    db.refresh(new_student)
+
+    return {"id": new_student.id}
 
 
+# READ ALL
 @app.get("/students", response_model=list[Student])
 async def list_students(country: str = None, age: int = None):
-    query = {}
+    db = next(get_db())
+
+    query = db.query(StudentDB)
+
     if country:
-        query["address.country"] = country
+        query = query.filter(StudentDB.country == country)
     if age:
-        query["age"] = {"$gte": age}
-    students = list(students_collection.find(query, {"_id": 0}))
-    return students
+        query = query.filter(StudentDB.age >= age)
+
+    students = query.all()
+
+    return [
+        {
+            "name": s.name,
+            "age": s.age,
+            "address": {"city": s.city, "country": s.country}
+        }
+        for s in students
+    ]
 
 
+# READ ONE
 @app.get("/students/{id}", response_model=Student)
-async def get_student(id: str):
-    student = students_collection.find_one({"_id": ObjectId(id)}, {"_id": 0})
-    if student:
-        return student
-    else:
+async def get_student(id: int):
+    db = next(get_db())
+
+    student = db.query(StudentDB).filter(StudentDB.id == id).first()
+
+    if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
+    return {
+        "name": student.name,
+        "age": student.age,
+        "address": {"city": student.city, "country": student.country}
+    }
 
+
+# UPDATE
 @app.patch("/students/{id}", status_code=204)
-async def update_student(id: str, student: Student):
-    updated_student = student.dict(exclude_unset=True)
-    result = students_collection.update_one(
-        {"_id": ObjectId(id)}, {"$set": updated_student})
-    if result.modified_count == 0:
+async def update_student(id: int, student: Student):
+    db = next(get_db())
+
+    db_student = db.query(StudentDB).filter(StudentDB.id == id).first()
+
+    if not db_student:
         raise HTTPException(status_code=404, detail="Student not found")
-    else:
-        return
+
+    db_student.name = student.name
+    db_student.age = student.age
+    db_student.city = student.address.city
+    db_student.country = student.address.country
+
+    db.commit()
 
 
+# DELETE
 @app.delete("/students/{id}", status_code=200)
-async def delete_student(id: str):
-    result = students_collection.delete_one({"_id": ObjectId(id)})
-    if result.deleted_count == 0:
+async def delete_student(id: int):
+    db = next(get_db())
+
+    student = db.query(StudentDB).filter(StudentDB.id == id).first()
+
+    if not student:
         raise HTTPException(status_code=404, detail="Student not found")
-    else:
-        return {"message": "Student deleted successfully"}
+
+    db.delete(student)
+    db.commit()
+
+    return {"message": "Student deleted successfully"}
